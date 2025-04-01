@@ -1,0 +1,24 @@
+[main]
+debug = false
+main_buffer_size = 1000      
+# Size of the main message queue
+handler_buffer_size = 1000   
+# Size for both MQTT and HTTP handler buffers
+group_prefix= 0020295
+buffer_size = 1000
+[rtl-sdr]
+cmd = rtl_fm -d 0 -f 169.65M -M fm -s 22050  | multimon-ng -a FLEX -t raw -
+
+[home-assistant]
+enabled = true
+baseurl = http://a.b.c.d:8123
+token = <token>
+
+[mqtt]
+enabled = true
+mqtt_server = a.b.c.d IP
+mqtt_port = 1883
+mqtt_user = homeassistant
+mqtt_password = <password>
+mqtt_topic = p2000
+mqtt_qos=1
