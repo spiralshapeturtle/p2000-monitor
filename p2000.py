@@ -14,8 +14,7 @@ from collections import deque
 from datetime import datetime
 from asyncio import Event, Queue
 from typing import Optional, Dict, List, Any, Tuple, Union
-import asyncio_mqtt as aiomqtt
-
+import aiomqtt
 VERSION = "1.0"
 CFGFILE = "config.ini"
 
@@ -119,10 +118,10 @@ class AsyncHTTPHandler(BaseHandler):
                 await self.session.close()
                 
             connector = aiohttp.TCPConnector(
-                limit=20, # Meer parallelle verbindingen
+                limit=20, # More parallel connections
                 force_close=False,
                 enable_cleanup_closed=True,
-                keepalive_timeout=60.0  # Verbindingen 60 seconden in pool houden als ze niet gebruikt worden
+                keepalive_timeout=60.0  # Keep connections in pool for 60 seconds when idle
             )
             
             timeout = aiohttp.ClientTimeout(
@@ -243,21 +242,6 @@ class AsyncMQTTHandler(BaseHandler):
             if self._connection_task and not self._connection_task.done():
                 self._connection_task.cancel()
                 
-            client_kwargs = {
-                "hostname": self.config["server"],
-                "port": self.config["port"],
-                "client_id": f"p2000_receiver_{os.getpid()}",
-                "clean_session": False,
-                "keepalive": 15
-            }
-            
-            if self.config["user"] and self.config["password"]:
-                client_kwargs.update({
-                    "username": self.config["user"],
-                    "password": self.config["password"]
-                })
-                
-            self.client = aiomqtt.Client(**client_kwargs)
             self._connection_task = asyncio.create_task(self._manage_connection())
             
         except Exception as e:
@@ -267,7 +251,7 @@ class AsyncMQTTHandler(BaseHandler):
                 asyncio.create_task(self.setup_connection())
                 
     async def _manage_connection(self):
-        """Manage MQTT connection with improved reconnection handling."""
+        """Manage MQTT connection with aiomqtt v2.x context manager."""
         while not self._shutdown:
             try:
                 if not self.connected:
@@ -275,46 +259,37 @@ class AsyncMQTTHandler(BaseHandler):
                     if (self.last_reconnect_attempt is None or
                         (current_time - self.last_reconnect_attempt).total_seconds() >= self.reconnect_delay):
                         
-                        logging.info("MQTT attempting to connect...")
+                        broker = f"{self.config['server']}:{self.config['port']}"
+                        logging.info(f"MQTT attempting to connect to {broker}...")
                         self.last_reconnect_attempt = current_time
-                        
+
                         try:
-                            if self.client:
-                                try:
-                                    await self.client.disconnect()
-                                except:
-                                    pass
-                                self.client = None
-                                
-                            # Create new client instance for each connection attempt
-                            client_kwargs = {
-                                "hostname": self.config["server"],
-                                "port": self.config["port"],
-                                "client_id": f"p2000_receiver_{os.getpid()}_{int(time.time())}",
-                                "clean_session": True,
-                                "keepalive": 15
-                            }
-                            
-                            if self.config["user"] and self.config["password"]:
-                                client_kwargs.update({
-                                    "username": self.config["user"],
-                                    "password": self.config["password"]
-                                })
-                                
-                            self.client = aiomqtt.Client(**client_kwargs)
-                            await self.client.connect()
-                            self.connected = True
-                            self.connection_attempts += 1
-                            self.reconnect_delay = 1
-                            logging.info(f"MQTT connected successfully after {self.connection_attempts} attempts")
-                            
-                            # Process pending messages after successful connection
-                            if self.pending_messages:
-                                await self.process_pending_messages()
-                                
+                            async with aiomqtt.Client(
+                                hostname=self.config["server"],
+                                port=self.config["port"],
+                                identifier=f"p2000_receiver_{os.getpid()}_{int(time.time())}",
+                                username=self.config["user"] if self.config["user"] else None,
+                                password=self.config["password"] if self.config["password"] else None,
+                                clean_start=True,
+                                protocol=aiomqtt.ProtocolVersion.V5,
+                                keepalive=15
+                            ) as client:
+                                self.client = client
+                                self.connected = True
+                                self.connection_attempts += 1
+                                self.reconnect_delay = 1
+                                logging.info(f"MQTT {broker} connected successfully after {self.connection_attempts} attempts")
+
+                                if self.pending_messages:
+                                    await self.process_pending_messages()
+
+                                while self.connected and not self._shutdown:
+                                    await asyncio.sleep(1)
+
                         except Exception as e:
                             self.connected = False
-                            logging.error(f"MQTT connection attempt failed: {str(e)}")
+                            self.client = None
+                            logging.error(f"MQTT {broker} connection attempt failed: {str(e)}")
                             self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
                             await asyncio.sleep(self.reconnect_delay)
                             
@@ -323,20 +298,20 @@ class AsyncMQTTHandler(BaseHandler):
             except Exception as e:
                 logging.error(f"Error in MQTT connection management: {str(e)}")
                 self.connected = False
+                self.client = None
                 await asyncio.sleep(self.reconnect_delay)
                 
             if self._shutdown:
                 break
                 
     async def send_single_message(self, topic: str, payload: str, qos: int = 1) -> bool:
-        """Implementation of MQTT message sending with improved connection handling."""
+        """Implementation of MQTT message sending."""
+        broker = f"{self.config['server']}:{self.config['port']}"
         try:
             if not self.connected or not self.client:
                 self.pending_messages.append((topic, payload, qos))
-                pending_count = len(self.pending_messages)
-                logging.warning(f"MQTT not connected, message queued (pending: {pending_count})")
+                logging.warning(f"MQTT {broker} not connected, message queued (pending: {len(self.pending_messages)})")
 
-                # Ensure connection management is running
                 if self._connection_task is None or self._connection_task.done():
                     self._connection_task = asyncio.create_task(self._manage_connection())
                 return False
@@ -345,11 +320,11 @@ class AsyncMQTTHandler(BaseHandler):
             return True
 
         except Exception as e:
-            logging.error(f"MQTT send error: {str(e)}")
+            logging.error(f"MQTT {broker} send error: {str(e)}")
             self.connected = False
+            self.client = None
             self.pending_messages.append((topic, payload, qos))
-            
-            # Trigger reconnection
+
             if self._connection_task is None or self._connection_task.done():
                 self._connection_task = asyncio.create_task(self._manage_connection())
             return False
@@ -367,12 +342,8 @@ class AsyncMQTTHandler(BaseHandler):
                 except asyncio.CancelledError:
                     pass
                     
-            if self.client and self.connected:
-                try:
-                    await asyncio.wait_for(self.client.disconnect(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    logging.error("MQTT disconnect timed out")
-                    
+            self.connected = False
+            self.client = None
             logging.info("MQTT client shutdown complete")
             
         except Exception as e:
@@ -407,20 +378,22 @@ class AsyncP2000Receiver:
         self.messages: Queue[MessageItem] = Queue(maxsize=self.buffer_size)
         self.rtl_process = None
         self._tasks = []
-        self.mqtt_handler = None
+        self.mqtt_handlers: List[AsyncMQTTHandler] = []
         self.http_handler = None
         self.device_ready = Event()
-        
+        self._fragments: dict = {}
+        self._fragments = {}
+        self._FRAGMENT_TTL = 10
+
         # Configure logging
         self._setup_logging()
-        
+
         # Load RTL-SDR command
         self.rtlfm_cmd = self.config.get("rtl-sdr", "cmd")
         logging.info(f"RTL-SDR command: {self.rtlfm_cmd}")
-        
+
         # Initialize handlers based on config
         self.use_hass = self.config.getboolean("home-assistant", "enabled")
-        self.use_mqtt = self.config.getboolean("mqtt", "enabled")
         
     def _load_config(self) -> configparser.ConfigParser:
         """Load or create configuration file."""
@@ -454,7 +427,17 @@ class AsyncP2000Receiver:
             "mqtt_topic": "p2000",
             "mqtt_qos": "1",
         }
-        
+
+        config["mqtt2"] = {
+            "enabled": "false",
+            "mqtt_server": "172.16.1.28",
+            "mqtt_port": "1883",
+            "mqtt_user": "mqttuser",
+            "mqtt_password": "password",
+            "mqtt_topic": "p2000",
+            "mqtt_qos": "1",
+        }
+
         with open(CFGFILE, "w") as f:
             config.write(f)
             logging.info(f"Created new config file: {CFGFILE}")
@@ -533,26 +516,35 @@ class AsyncP2000Receiver:
             logging.error(f"Error setting up Home Assistant: {e}")
             self.use_hass = False
 
-    async def setup_mqtt(self):
-        """Initialize MQTT connection."""
-        try:
-            logging.info("Setting up MQTT connection...")
-            self.mqtt_config = {
-                "server": self.config.get("mqtt", "mqtt_server"),
-                "port": self.config.getint("mqtt", "mqtt_port"),
-                "user": self.config.get("mqtt", "mqtt_user"),
-                "password": self.config.get("mqtt", "mqtt_password"),
-                "topic": self.config.get("mqtt", "mqtt_topic"),
-                "qos": self.config.getint("mqtt", "mqtt_qos", fallback=1),
-                "buffer_size": self.buffer_size,
-            }
-            self.mqtt_handler = AsyncMQTTHandler(self.mqtt_config)
-            await self.mqtt_handler.setup_connection()
-            logging.info("MQTT connection setup complete")
-            
-        except Exception as e:
-            logging.error(f"Error setting up MQTT: {e}")
-            self.use_mqtt = False
+    def _build_mqtt_config(self, section: str) -> Dict[str, Any]:
+        """Build MQTT config dict from a config section."""
+        return {
+            "server": self.config.get(section, "mqtt_server"),
+            "port": self.config.getint(section, "mqtt_port"),
+            "user": self.config.get(section, "mqtt_user"),
+            "password": self.config.get(section, "mqtt_password"),
+            "topic": self.config.get(section, "mqtt_topic"),
+            "qos": self.config.getint(section, "mqtt_qos", fallback=1),
+            "buffer_size": self.buffer_size,
+        }
+
+    async def setup_mqtt_brokers(self):
+        """Initialize all enabled MQTT brokers in order (primary first)."""
+        for section in ("mqtt", "mqtt2"):
+            if not self.config.has_section(section):
+                continue
+            if not self.config.getboolean(section, "enabled", fallback=False):
+                logging.info(f"MQTT broker [{section}] is disabled, skipping")
+                continue
+            try:
+                cfg = self._build_mqtt_config(section)
+                logging.info(f"Setting up MQTT broker [{section}] ({cfg['server']})...")
+                handler = AsyncMQTTHandler(cfg)
+                await handler.setup_connection()
+                self.mqtt_handlers.append(handler)
+                logging.info(f"MQTT broker [{section}] ({cfg['server']}) setup complete")
+            except Exception as e:
+                logging.error(f"Error setting up MQTT broker [{section}]: {e}")
 
     async def post_message(self, msg: MessageItem):
         """Post message to configured endpoints."""
@@ -578,17 +570,17 @@ class AsyncP2000Receiver:
                 except Exception as e:
                     logging.error(f"HA Error: {e}")
 
-            # Post to MQTT
-            if self.use_mqtt and self.mqtt_handler:
+            # Post to MQTT brokers in order (primary first)
+            for handler in self.mqtt_handlers:
                 try:
-                    topic = f"{self.mqtt_config['topic']}/sensor/p2000"
-                    await self.mqtt_handler.send_single_message(
+                    topic = f"{handler.config['topic']}/sensor/p2000"
+                    await handler.send_single_message(
                         topic,
                         json.dumps(mqtt_data),
-                        qos=self.mqtt_config["qos"],
+                        qos=handler.config["qos"],
                     )
                 except Exception as e:
-                    logging.error(f"MQTT Error: {e}")
+                    logging.error(f"MQTT Error ({handler.config['server']}): {e}")
 
         except Exception as e:
             logging.error(f"Error in post_message: {e}")
@@ -714,13 +706,62 @@ class AsyncP2000Receiver:
                 except Exception as e:
                     logging.error(f"Error cleaning up RTL-SDR process: {e}")
 
+    async def _cleanup_fragments_loop(self):
+        """Periodically evict expired fragment buffer entries."""
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(60)
+                if self.shutdown_event.is_set():
+                    break
+                now = time.time()
+                expired = [k for k, v in list(self._fragments.items())
+                           if now - v['ts'] > self._FRAGMENT_TTL]
+                for k in expired:
+                    self._fragments.pop(k, None)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"Fragment cleanup error: {e}")
+
     async def handle_message(self, line: str, match: re.Match):
-        """Process and queue a new message."""
         try:
+            frame_field = match.group(2)
+            frag_match = re.search(r'/([KFC])/', frame_field)
+            frag_flag = frag_match.group(1) if frag_match else None
+
             capcodes = match.group(4).strip().split()
             message = match.group(5).strip()
 
-            if message and capcodes:
+            if not message or not capcodes:
+                return
+
+            receivers = " ".join(capcodes)
+            now = time.time()
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # --- F: First fragment — store per capcode, log and wait ---
+            if frag_flag == 'F':
+                for cap in capcodes:
+                    self._fragments[cap] = {'body': message, 'ts': now}
+                print(f"[{ts}] P2000:    [FRAG F] {receivers} | waiting for continuation...")
+                return
+
+            # --- C: Terminal fragment — combine with prior F if available, send immediately ---
+            if frag_flag == 'C':
+                stored_body = None
+                for cap in capcodes:
+                    entry = self._fragments.get(cap)
+                    if entry and now - entry['ts'] < self._FRAGMENT_TTL:
+                        stored_body = entry['body']
+                        break
+                if stored_body is not None:
+                    message = stored_body + message
+                    for cap in capcodes:
+                        self._fragments.pop(cap, None)
+                    print(f"[{ts}] P2000:    [FRAG C] {receivers} | continuation received")
+                else:
+                    print(f"[{ts}] P2000:    [FRAG C orphan] {receivers} | {message}")
+
                 msg = MessageItem(
                     message_raw=line.strip(),
                     timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
@@ -729,11 +770,30 @@ class AsyncP2000Receiver:
                 )
                 await self.messages.put(msg)
 
-                is_group = any(cap.startswith(self.config.get("main", "group_prefix")) 
-                             for cap in capcodes)
-                console_message = f"{message} - GROUP" if is_group else message
-                print(f"[{msg.timestamp}] P2000: {console_message}")
-                
+                tags = []
+                if len(capcodes) > 1:
+                    tags.append("GROUP")
+                tags.append("FRAGMENTED")
+                suffix = " - " + " ".join(tags)
+                print(f"[{ts}] P2000:    {receivers} | {message}{suffix}")
+                return
+
+            # --- K or None: standalone, no fragment store interaction ---
+            msg = MessageItem(
+                message_raw=line.strip(),
+                timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                body=message,
+                capcodes=capcodes,
+            )
+            await self.messages.put(msg)
+
+            tags = []
+            if len(capcodes) > 1:
+                tags.append("GROUP")
+            suffix = " - " + " ".join(tags) if tags else ""
+
+            print(f"[{ts}] P2000:    {receivers} | {message}{suffix}")
+
         except Exception as e:
             logging.error(f"Error handling message: {e}")
 
@@ -745,13 +805,13 @@ class AsyncP2000Receiver:
             # Initialize handlers
             if self.use_hass:
                 await self.setup_home_assistant()
-            if self.use_mqtt:
-                await self.setup_mqtt()
+            await self.setup_mqtt_brokers()
 
             # Create tasks
             self._tasks = [
                 asyncio.create_task(self.process_messages()),
-                asyncio.create_task(self.read_rtl_sdr())
+                asyncio.create_task(self.read_rtl_sdr()),
+                asyncio.create_task(self._cleanup_fragments_loop()),
             ]
 
             # Wait for shutdown signal
@@ -797,14 +857,14 @@ class AsyncP2000Receiver:
                     except Exception as e:
                         logging.error(f"Error during RTL-SDR cleanup: {e}")
                         
-                # Clean up MQTT
-                if self.mqtt_handler:
+                # Clean up MQTT brokers
+                for handler in self.mqtt_handlers:
                     try:
-                        await asyncio.wait_for(self.mqtt_handler.stop(), timeout=3.0)
+                        await asyncio.wait_for(handler.stop(), timeout=3.0)
                     except asyncio.TimeoutError:
-                        logging.error("MQTT shutdown timed out")
+                        logging.error(f"MQTT shutdown timed out ({handler.config['server']})")
                     except Exception as e:
-                        logging.error(f"Error during MQTT cleanup: {e}")
+                        logging.error(f"Error during MQTT cleanup ({handler.config['server']}): {e}")
                         
                 # Clean up HTTP
                 if self.http_handler:

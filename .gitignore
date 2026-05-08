@@ -1,1 +1,8 @@
 config.ini
+*.bak
+*.bck
+__pycache__/
+.claude/
+.venv/
+venv/
+*.log
