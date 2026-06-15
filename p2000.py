@@ -550,7 +550,7 @@ class AsyncP2000Receiver:
         """Post message to configured endpoints."""
         try:
             mqtt_data = {
-                "payload": {"message": msg.body, "address": msg.receivers}
+                "message": msg.body, "address": msg.receivers
             }
 
             ha_data = {
@@ -573,7 +573,7 @@ class AsyncP2000Receiver:
             # Post to MQTT brokers in order (primary first)
             for handler in self.mqtt_handlers:
                 try:
-                    topic = f"{handler.config['topic']}/sensor/p2000"
+                    topic = handler.config['topic']
                     await handler.send_single_message(
                         topic,
                         json.dumps(mqtt_data),
@@ -739,43 +739,48 @@ class AsyncP2000Receiver:
             now = time.time()
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # --- F: First fragment — store per capcode, log and wait ---
+            # --- F: First fragment — store body + full capcode list, log and wait ---
             if frag_flag == 'F':
                 for cap in capcodes:
-                    self._fragments[cap] = {'body': message, 'ts': now}
+                    self._fragments[cap] = {'body': message, 'capcodes': capcodes, 'ts': now}
                 print(f"[{ts}] P2000:    [FRAG F] {receivers} | waiting for continuation...")
                 return
 
             # --- C: Terminal fragment — combine with prior F if available, send immediately ---
             if frag_flag == 'C':
-                stored_body = None
+                stored = None
                 for cap in capcodes:
                     entry = self._fragments.get(cap)
                     if entry and now - entry['ts'] < self._FRAGMENT_TTL:
-                        stored_body = entry['body']
+                        stored = entry
                         break
-                if stored_body is not None:
-                    message = stored_body + message
-                    for cap in capcodes:
+                if stored is not None:
+                    message = stored['body'] + message
+                    # Restore full capcode list from FRAG F (includes all group subscribers)
+                    full_capcodes = stored['capcodes']
+                    # Clean up ALL capcodes stored by FRAG F, not just the FRAG C subset
+                    for cap in stored['capcodes']:
                         self._fragments.pop(cap, None)
                     print(f"[{ts}] P2000:    [FRAG C] {receivers} | continuation received")
                 else:
+                    full_capcodes = capcodes
                     print(f"[{ts}] P2000:    [FRAG C orphan] {receivers} | {message}")
 
                 msg = MessageItem(
                     message_raw=line.strip(),
                     timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
                     body=message,
-                    capcodes=capcodes,
+                    capcodes=full_capcodes,
                 )
                 await self.messages.put(msg)
 
+                full_receivers = " ".join(full_capcodes)
                 tags = []
-                if len(capcodes) > 1:
+                if len(full_capcodes) > 1:
                     tags.append("GROUP")
                 tags.append("FRAGMENTED")
                 suffix = " - " + " ".join(tags)
-                print(f"[{ts}] P2000:    {receivers} | {message}{suffix}")
+                print(f"[{ts}] P2000:    {full_receivers} | {message}{suffix}")
                 return
 
             # --- K or None: standalone, no fragment store interaction ---
